@@ -1129,6 +1129,19 @@ func (ctx *RequestContext) Render(code int, r render.Render) {
 	}
 }
 
+// Negotiate performs server-driven content negotiation with an explicit
+// representation set.
+//
+// It selects one representation according to the request Accept and
+// Accept-Encoding header fields and the server-side weights, responds 406
+// when nothing is acceptable, handles GET/HEAD If-None-Match (304 via weak
+// comparison, without rendering), and otherwise invokes exactly the
+// renderer of the selected representation once. See
+// render.RepresentationSet for the full semantics.
+func (ctx *RequestContext) Negotiate(reps *render.RepresentationSet) error {
+	return reps.Negotiate(&ctx.Request, &ctx.Response)
+}
+
 // ProtoBuf serializes the given struct as ProtoBuf into the response body.
 func (ctx *RequestContext) ProtoBuf(code int, obj interface{}) {
 	ctx.Render(code, render.ProtoBuf{Data: obj})
