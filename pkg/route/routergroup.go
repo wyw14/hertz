@@ -133,6 +133,27 @@ func (group *RouterGroup) Handle(httpMethod, relativePath string, handlers ...ap
 	return group.handle(httpMethod, relativePath, handlers)
 }
 
+// HandleNamed is like Handle but also binds an explicit, globally unique route
+// name to the final path obtained after composing the group prefix. The name
+// (rather than the handler function name) can later be used with Engine.URLFor
+// to regenerate a URL that re-matches this route.
+//
+// It panics when name is empty, the HTTP method is invalid, or the name is
+// already in use. Registering through the unnamed methods is still supported
+// and leaves the route without a name.
+func (group *RouterGroup) HandleNamed(name, httpMethod, relativePath string, handlers ...app.HandlerFunc) IRoutes {
+	if name == "" {
+		panic(ErrRouteNameEmpty.Error())
+	}
+	if matches := upperLetterReg.MatchString(httpMethod); !matches {
+		panic("http method " + httpMethod + " is not valid")
+	}
+	absolutePath := group.calculateAbsolutePath(relativePath)
+	chain := group.combineHandlers(handlers)
+	group.engine.addRouteNamed(httpMethod, absolutePath, chain, name)
+	return group.returnObj()
+}
+
 // POST is a shortcut for router.Handle("POST", path, handle).
 func (group *RouterGroup) POST(relativePath string, handlers ...app.HandlerFunc) IRoutes {
 	return group.handle(consts.MethodPost, relativePath, handlers)

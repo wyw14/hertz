@@ -109,6 +109,7 @@ type CtxErrCallback func(ctx context.Context) error
 type RouteInfo struct {
 	Method      string
 	Path        string
+	Name        string
 	Handler     string
 	HandlerFunc app.HandlerFunc
 }
@@ -129,6 +130,14 @@ type Engine struct {
 	// route
 	RouterGroup
 	trees MethodTrees
+
+	// named routes. routeReg is a copy-on-write *routeRegistry published
+	// atomically so URLFor readers never block and always observe a single
+	// consistent generation of the name -> (method, path) mapping. Writers
+	// (route registration) hold routeNamesMu while mutating the match tree and
+	// publishing the next snapshot.
+	routeNamesMu sync.Mutex
+	routeReg     atomic.Value // *routeRegistry
 
 	maxParams uint16
 
@@ -655,6 +664,7 @@ func NewEngine(opt *config.Options) *Engine {
 		engine.transport = opt.TransporterNewer(opt)
 	}
 	engine.RouterGroup.engine = engine
+	engine.routeReg.Store(newRouteRegistry())
 
 	traceLevel := initTrace(engine)
 
@@ -703,6 +713,16 @@ func debugPrintRoute(httpMethod, absolutePath string, handlers app.HandlersChain
 }
 
 func (engine *Engine) addRoute(method, path string, handlers app.HandlersChain) {
+	engine.routeNamesMu.Lock()
+	engine.insertRoute(method, path, handlers)
+	// advance the generation so name mapping and match tree always move together
+	engine.bumpRouteGenerationLocked()
+	engine.routeNamesMu.Unlock()
+}
+
+// insertRoute mutates the match tree. Callers must hold routeNamesMu so that a
+// structural change is never interleaved with name-registry publication.
+func (engine *Engine) insertRoute(method, path string, handlers app.HandlersChain) {
 	if len(path) == 0 {
 		panic("path should not be ''")
 	}
@@ -1040,10 +1060,11 @@ func (engine *Engine) hijackConnHandler(c network.Conn, h app.HijackHandler) {
 }
 
 // Routes returns a slice of registered routes, including some useful information, such as:
-// the http method, path and the handler name.
+// the http method, path, the explicit route name (empty for unnamed routes) and the handler name.
 func (engine *Engine) Routes() (routes RoutesInfo) {
+	names := engine.routeRegistryLoad().routeName
 	for _, tree := range engine.trees {
-		routes = iterate(tree.method, routes, tree.root)
+		routes = iterate(tree.method, routes, tree.root, names)
 	}
 
 	return routes
@@ -1063,27 +1084,28 @@ func (engine *Engine) HasServer(name string) bool {
 }
 
 // iterate iterates the method tree by depth firstly.
-func iterate(method string, routes RoutesInfo, root *node) RoutesInfo {
+func iterate(method string, routes RoutesInfo, root *node, names map[string]string) RoutesInfo {
 	if len(root.handlers) > 0 {
 		handlerFunc := root.handlers.Last()
 		routes = append(routes, RouteInfo{
 			Method:      method,
 			Path:        root.ppath,
+			Name:        names[routeKey(method, root.ppath)],
 			Handler:     utils.NameOfFunction(handlerFunc),
 			HandlerFunc: handlerFunc,
 		})
 	}
 
 	for _, child := range root.children {
-		routes = iterate(method, routes, child)
+		routes = iterate(method, routes, child, names)
 	}
 
 	if root.paramChild != nil {
-		routes = iterate(method, routes, root.paramChild)
+		routes = iterate(method, routes, root.paramChild, names)
 	}
 
 	if root.anyChild != nil {
-		routes = iterate(method, routes, root.anyChild)
+		routes = iterate(method, routes, root.anyChild, names)
 	}
 	return routes
 }
