@@ -165,6 +165,14 @@ type Engine struct {
 	protocolServers       map[string]protocol.Server
 	protocolStreamServers map[string]protocol.StreamServer
 
+	// Route-level HTTP/1.1 concurrency admission, keyed by method+"\n"+fullPath.
+	concurrencyMu     sync.RWMutex
+	concurrencyLimits map[string]*ConcurrencyLimit
+	// shutdownCh is closed once when the engine starts shutting down (or is
+	// force-closed); it wakes every request waiting in an admission queue.
+	shutdownCh   chan struct{}
+	shutdownOnce sync.Once
+
 	// RequestContext pool
 	ctxPool sync.Pool
 
@@ -311,6 +319,10 @@ func (engine *Engine) Shutdown(ctx context.Context) (err error) {
 	if !atomic.CompareAndSwapUint32(&engine.status, statusRunning, statusShutdown) {
 		return
 	}
+
+	// Wake all requests waiting in route-level admission queues. In-flight
+	// requests keep their permits until their exchange finishes.
+	engine.signalShutdown()
 
 	opt := engine.GetOptions()
 	hlog.SystemLogger().Infof("Begin graceful shutdown, wait at most %s ...", opt.ExitWaitTimeout)
@@ -482,10 +494,21 @@ func logError(conn network.Conn, err error) {
 }
 
 func (engine *Engine) Close() error {
+	// Force-close also wakes admission waiters so they cannot outlive the
+	// engine while blocked in a queue.
+	engine.signalShutdown()
 	if engine.htmlRender != nil {
 		engine.htmlRender.Close() //nolint:errcheck
 	}
 	return engine.transport.Close()
+}
+
+// signalShutdown closes the admission wake channel exactly once. It is safe
+// to call from both graceful Shutdown and forceful Close.
+func (engine *Engine) signalShutdown() {
+	engine.shutdownOnce.Do(func() {
+		close(engine.shutdownCh)
+	})
 }
 
 func (engine *Engine) GetServerName() []byte {
@@ -647,6 +670,8 @@ func NewEngine(opt *config.Options) *Engine {
 		tracerCtl:             &internalStats.Controller{},
 		protocolServers:       make(map[string]protocol.Server),
 		protocolStreamServers: make(map[string]protocol.StreamServer),
+		concurrencyLimits:     make(map[string]*ConcurrencyLimit),
+		shutdownCh:            make(chan struct{}),
 		enableTrace:           true,
 		options:               opt,
 	}
@@ -1106,6 +1131,7 @@ func newHttp1OptionFromEngine(engine *Engine) *http1.Option {
 		HTMLRender:                    engine.htmlRender,
 		EnableTrace:                   engine.IsTraceEnable(),
 		HijackConnHandle:              engine.HijackConnHandle,
+		AdmissionController:           engine,
 		DisableHeaderNamesNormalizing: engine.options.DisableHeaderNamesNormalizing,
 		NoDefaultDate:                 engine.options.NoDefaultDate,
 		NoDefaultContentType:          engine.options.NoDefaultContentType,

@@ -236,6 +236,10 @@ type RequestContext struct {
 
 	binder binding.Binder
 	exiled bool
+
+	// concurrencyPermitTransferred marks that a route-level concurrency permit
+	// must stay held while a hijack handler runs instead of refusing hijack.
+	concurrencyPermitTransferred bool
 }
 
 // Exile marks this RequestContext as not to be recycled.
@@ -444,6 +448,24 @@ type HijackHandler func(c network.Conn)
 //   - HTTP/2.0 ( https://en.wikipedia.org/wiki/HTTP/2 )
 func (ctx *RequestContext) Hijack(handler HijackHandler) {
 	ctx.hijackHandler = handler
+}
+
+// TransferConcurrencyPermit explicitly keeps the route-level concurrency
+// permit held while the subsequently registered Hijack handler runs; the
+// permit is released when the hijack handler returns.
+//
+// It must be called BEFORE Hijack on a route with route-level concurrency
+// limits. Without it, hijack is refused and the connection is closed after
+// the response flush, so a limited route cannot silently become an unbounded
+// connection. Calling it on routes without concurrency limits has no effect.
+func (ctx *RequestContext) TransferConcurrencyPermit() {
+	ctx.concurrencyPermitTransferred = true
+}
+
+// ConcurrencyPermitTransferred reports whether the handler explicitly
+// transferred the route concurrency permit to the hijacked connection.
+func (ctx *RequestContext) ConcurrencyPermitTransferred() bool {
+	return ctx.concurrencyPermitTransferred
 }
 
 // Last returns the last handler of the handler chain.
@@ -857,6 +879,7 @@ func (ctx *RequestContext) ResetWithoutConn() {
 	ctx.index = -1
 	ctx.fullPath = ""
 	ctx.Keys = nil
+	ctx.concurrencyPermitTransferred = false
 
 	if ctx.finished != nil {
 		close(ctx.finished)

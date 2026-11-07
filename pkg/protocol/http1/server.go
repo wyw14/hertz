@@ -82,6 +82,11 @@ type Option struct {
 	EnableTrace                   bool
 	ContinueHandler               func(header *protocol.RequestHeader) bool
 	HijackConnHandle              func(c network.Conn, h app.HijackHandler)
+
+	// AdmissionController optionally enforces route-level concurrency
+	// admission. It is invoked after request headers are parsed and before the
+	// request body is read and the handler chain runs.
+	AdmissionController AdmissionController
 }
 
 type Server struct {
@@ -132,7 +137,19 @@ func (s Server) Serve(c context.Context, conn network.Conn) (err error) {
 		// Use a new variable to hold the standard context to avoid modify the initial
 		// context.
 		cc = c
+
+		// permit is the route-level concurrency slot of the current exchange.
+		// It is nil for unlimited routes and released explicitly at exchange
+		// end; this defer is the backstop for every early return and panic so
+		// a slot can never leak (Release itself is exactly-once).
+		permit Permit
 	)
+
+	defer func() {
+		if permit != nil {
+			permit.Release()
+		}
+	}()
 
 	if s.EnableTrace {
 		eventsToTrigger = s.eventStackPool.Get().(*eventStack)
@@ -181,6 +198,14 @@ func (s Server) Serve(c context.Context, conn network.Conn) (err error) {
 
 	for {
 		connRequestNum++
+
+		// Route-level admission state for this request.
+		permit = nil
+		var (
+			admitted    = true
+			admission   Admission
+			rejectDrain bool
+		)
 
 		if zr == nil {
 			zr = ctx.GetReader()
@@ -234,11 +259,44 @@ func (s Server) Serve(c context.Context, conn network.Conn) (err error) {
 					internalStats.Record(ti, stats.ReadBodyFinish, err)
 				})
 			}
-			// Read body
-			if s.StreamRequestBody {
-				err = req.ReadBodyStream(&ctx.Request, zr, s.MaxRequestBodySize, s.GetOnly, !s.DisablePreParseMultipartForm)
-			} else {
-				err = req.ReadLimitBody(&ctx.Request, zr, s.MaxRequestBodySize, s.GetOnly, !s.DisablePreParseMultipartForm)
+
+			// Route-level concurrency admission runs after the headers are
+			// parsed but BEFORE the request body is read, so requests waiting
+			// in the queue never buffer an unbounded body.
+			if s.AdmissionController != nil {
+				admission = s.AdmissionController.Acquire(cc, conn, &ctx.Request)
+				if admission.Rejected {
+					admitted = false
+					if admission.Canceled {
+						// Context canceled or peer disconnect observed. No
+						// response is guaranteed to arrive; the unread body is
+						// not drained, so the connection must be closed.
+						err = errShortConnection
+						return
+					}
+					// Boundedly consume the unread body so the next keep-alive
+					// request cannot see stale bytes. Chunked/oversized bodies
+					// or drain errors force the connection to close. A request
+					// waiting for "100 Continue" is not drained: the client is
+					// allowed not to have sent the body yet, so waiting for it
+					// could block until the read timeout; close instead.
+					if ctx.Request.MayContinue() {
+						rejectDrain = false
+					} else {
+						rejectDrain = drainUnreadRequestBody(zr, &ctx.Request, admission.MaxDrainBytes)
+					}
+				} else if admission.Permit != nil {
+					permit = admission.Permit
+				}
+			}
+
+			if admitted {
+				// Read body
+				if s.StreamRequestBody {
+					err = req.ReadBodyStream(&ctx.Request, zr, s.MaxRequestBodySize, s.GetOnly, !s.DisablePreParseMultipartForm)
+				} else {
+					err = req.ReadLimitBody(&ctx.Request, zr, s.MaxRequestBodySize, s.GetOnly, !s.DisablePreParseMultipartForm)
+				}
 			}
 		}
 
@@ -268,7 +326,7 @@ func (s Server) Serve(c context.Context, conn network.Conn) (err error) {
 
 		// 'Expect: 100-continue' request handling.
 		// See https://www.w3.org/Protocols/rfc2616/rfc2616-sec8.html#sec8.2.3 for details.
-		if ctx.Request.MayContinue() {
+		if admitted && ctx.Request.MayContinue() {
 			// Allow the ability to deny reading the incoming request body
 			if s.ContinueHandler != nil {
 				if continueReadingRequest = s.ContinueHandler(&ctx.Request.Header); !continueReadingRequest {
@@ -334,7 +392,22 @@ func (s Server) Serve(c context.Context, conn network.Conn) (err error) {
 		//
 		// NOTE: All middlewares and business handler will be executed in this. And at this point, the request has been parsed
 		// and the route has been matched.
-		s.Core.ServeHTTP(cc, ctx)
+		if admitted {
+			s.Core.ServeHTTP(cc, ctx)
+		} else {
+			// Rejected by route-level admission (queue full / wait timeout /
+			// body budget / shutdown). No handler runs; the permit is nil.
+			ctx.SetStatusCode(admission.StatusCode)
+			if len(admission.Body) > 0 {
+				ctx.Response.Header.SetContentTypeBytes(bytestr.DefaultContentType)
+				ctx.Response.SetBody(admission.Body)
+			}
+			if !rejectDrain {
+				// The unread body could not be consumed safely: do not reuse
+				// the connection, otherwise the next request would read it.
+				ctx.SetConnectionClose()
+			}
+		}
 		if s.EnableTrace {
 			// application layer handle finished
 			if last := eventsToTrigger.pop(); last != nil {
@@ -407,6 +480,16 @@ func (s Server) Serve(c context.Context, conn network.Conn) (err error) {
 		}
 
 		if hijackHandler != nil {
+			if permit != nil && !ctx.ConcurrencyPermitTransferred() {
+				// A concurrency-limited route must not silently turn into an
+				// unbounded hijacked connection: refuse to run the hijack
+				// handler and close the connection. The response (e.g. an
+				// Upgrade response) has already been flushed above.
+				hlog.SystemLogger().Errorf("http1: hijack on a concurrency-limited route requires an explicit permit transfer via ctx.TransferConcurrencyPermit(); closing connection")
+				permit.Release()
+				permit = nil
+				return errShortConnection
+			}
 			// Hijacked conn process the timeout by itself
 			err = ctx.GetConn().SetReadTimeout(0)
 			if err != nil {
@@ -415,8 +498,22 @@ func (s Server) Serve(c context.Context, conn network.Conn) (err error) {
 
 			// Hijack and block the connection until the hijackHandler return
 			s.HijackConnHandle(ctx.GetConn(), hijackHandler)
+			// With an explicit lease transfer the route permit stays owned
+			// across the hijacked handler and returns when it finishes.
+			if permit != nil {
+				permit.Release()
+				permit = nil
+			}
 			err = errHijacked
 			return
+		}
+
+		// The full exchange (handler, response flush and request body stream
+		// completion) is done: release the route permit before the connection
+		// is reused or closed.
+		if permit != nil {
+			permit.Release()
+			permit = nil
 		}
 
 		if connectionClose {
