@@ -722,6 +722,36 @@ func (ctx *RequestContext) MultipartForm() (*multipart.Form, error) {
 	return ctx.Request.MultipartForm()
 }
 
+// MultipartReader returns a streaming, resource-bounded multipart reader
+// for the request.
+//
+// Unlike MultipartForm, the request body is consumed one part at a time;
+// the whole form is never parsed up front and uploaded files are never
+// written to temporary files. The supplied options bound the part count,
+// per-part header bytes/fields, regular field bytes, per-file and
+// aggregate file bytes, and the bounded drain budget. Quotas advance
+// with bytes actually read and are shared across parts and nested reads
+// (they are not reset per part); they also apply when Content-Length is
+// unknown.
+//
+// MultipartReader is mutually exclusive with MultipartForm/FormFile and
+// with the server-side multipart pre-parse. To stream uploads directly
+// from the wire create the server with WithStreamBody(true) and
+// WithDisablePreParseMultipartForm(true); otherwise the request body has
+// already been buffered or pre-parsed before the handler runs.
+//
+// The reader is finalized automatically at the end of request
+// processing: remaining parts are skipped within the drain budget, and
+// if the body cannot be consumed in budget the connection is closed
+// rather than draining an unbounded body for keep-alive.
+func (ctx *RequestContext) MultipartReader(opts ...*protocol.MultipartReaderOptions) (*protocol.MultipartReader, error) {
+	var o *protocol.MultipartReaderOptions
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+	return ctx.Request.MultipartReader(o)
+}
+
 // SaveUploadedFile uploads the form file to specific dst.
 func (ctx *RequestContext) SaveUploadedFile(file *multipart.FileHeader, dst string) error {
 	src, err := file.Open()

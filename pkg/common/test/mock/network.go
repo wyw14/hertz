@@ -174,6 +174,16 @@ func NewConn(source string) *Conn {
 	}
 }
 
+// NewConnWithReader builds a mock connection whose request side reads
+// from an arbitrary io.Reader. It is useful in tests that need to count
+// the bytes actually pulled by the server (for example bounded drains).
+func NewConnWithReader(r io.Reader) *Conn {
+	return &Conn{
+		zr: netpoll.NewReader(r),
+		zw: netpoll.NewReadWriter(&bytes.Buffer{}),
+	}
+}
+
 type BrokenConn struct {
 	*Conn
 }

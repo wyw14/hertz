@@ -99,6 +99,10 @@ type Request struct {
 
 	multipartForm         *multipart.Form
 	multipartFormBoundary string
+	// multipartReader is the active restricted streaming multipart
+	// reader. While it is set the body must not be consumed through
+	// another reader or via MultipartForm.
+	multipartReader *MultipartReader
 
 	// Group bool members in order to reduce Request object size.
 	parsedURI      bool
@@ -233,6 +237,10 @@ func (req *Request) MultipartForm() (*multipart.Form, error) {
 	if req.multipartForm != nil {
 		return req.multipartForm, nil
 	}
+	if req.multipartReader != nil {
+		return nil, newMultipartError(ErrMultipartReaderConflictKind, 0,
+			"MultipartForm cannot be used while a restricted MultipartReader is active")
+	}
 	req.multipartFormBoundary = string(req.Header.MultipartFormBoundary())
 	if len(req.multipartFormBoundary) == 0 {
 		return nil, errors.ErrNoMultipartForm
@@ -278,6 +286,85 @@ func (req *Request) MultipartForm() (*multipart.Form, error) {
 	}
 	req.multipartForm = f
 	return f, nil
+}
+
+// MultipartReader returns a streaming, resource-bounded reader for the
+// request's multipart/form-data body.
+//
+// Parts are consumed one at a time; the whole form is never parsed up
+// front and uploaded files are never spooled to temporary files. The
+// limits in opts (part count, per-part header bytes and fields, regular
+// field bytes, per-file and aggregate file bytes, and a bounded drain
+// budget) are enforced against bytes actually read, so they also apply
+// when Content-Length is unknown (chunked transfer encoding). Aggregate
+// quotas are shared across all parts and nested reads; they are never
+// reset when moving to the next part.
+//
+// MultipartReader is mutually exclusive with the eager multipart form
+// pre-parse: if the form has already been parsed (either by the server
+// when pre-parsing is enabled, or by a previous MultipartForm call), an
+// ErrMultipartPreParsed typed error is returned. To stream large uploads
+// from the wire configure the server with WithStreamBody(true) and
+// WithDisablePreParseMultipartForm(true).
+//
+// Only one streaming reader may consume the request body at a time; a
+// second MultipartReader call while one is active returns
+// ErrMultipartReaderConflict. While a reader is active, MultipartForm
+// and FormFile return the same conflict error.
+//
+// The returned reader is finalized automatically at the end of request
+// processing; callers may still Close it explicitly to release the
+// unread parts with the bounded drain policy.
+func (req *Request) MultipartReader(opts *MultipartReaderOptions) (*MultipartReader, error) {
+	if req.multipartReader != nil {
+		return nil, newMultipartError(ErrMultipartReaderConflictKind, 0,
+			"another restricted MultipartReader is already consuming the request body")
+	}
+	if req.multipartForm != nil {
+		return nil, newMultipartError(ErrMultipartPreParsedKind, 0, "")
+	}
+	if ce := req.Header.peek(consts.HeaderContentEncoding); len(ce) > 0 {
+		return nil, newMultipartError(ErrMultipartUnsupportedEncodingKind, 0,
+			fmt.Sprintf("unsupported Content-Encoding %q", string(ce)))
+	}
+
+	boundary := string(req.Header.MultipartFormBoundary())
+	var body io.Reader
+	if req.IsBodyStream() {
+		body = req.bodyStream
+	} else {
+		body = bytes.NewReader(req.BodyBytes())
+	}
+
+	mr, err := NewMultipartReader(body, boundary, opts)
+	if err != nil {
+		return nil, err
+	}
+	req.multipartReader = mr
+	return mr, nil
+}
+
+// IsMultipartReaderActive reports whether a restricted streaming
+// multipart reader has been created for the request.
+func (req *Request) IsMultipartReaderActive() bool {
+	return req.multipartReader != nil
+}
+
+// FinishMultipartReader finalizes the active restricted multipart
+// reader, applying its bounded drain policy to any unread parts. It is
+// safe to call when no reader is active or after an explicit Close.
+func (req *Request) FinishMultipartReader() error {
+	if req.multipartReader == nil {
+		return nil
+	}
+	return req.multipartReader.Close()
+}
+
+// MultipartReaderNeedsClose reports whether the active multipart reader
+// could not bring the request body to a known end within its limits, so
+// the connection must be closed instead of being reused.
+func (req *Request) MultipartReaderNeedsClose() bool {
+	return req.multipartReader != nil && req.multipartReader.MustCloseConnection()
 }
 
 // AppendBodyString appends s to request body.
@@ -772,6 +859,10 @@ func (req *Request) RemoveMultipartFormFiles() {
 		req.multipartForm.RemoveAll() //nolint:errcheck
 		req.multipartForm = nil
 	}
+	// Drop any restricted streaming reader. The bounded drain /
+	// connection-close decision is taken separately at the end of
+	// request processing before the body stream is released.
+	req.multipartReader = nil
 	req.multipartFormBoundary = ""
 	req.multipartFiles = nil
 	req.multipartFields = nil

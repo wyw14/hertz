@@ -354,6 +354,21 @@ func (s Server) Serve(c context.Context, conn network.Conn) (err error) {
 		hijackHandler = ctx.GetHijackHandler()
 		ctx.SetHijackHandler(nil)
 
+		// Finalize a restricted streaming multipart reader if the
+		// handler created one. Unread parts are skipped within the
+		// configured drain budget; if the remaining body cannot be
+		// consumed in budget (or a fatal framing error occurred) the
+		// connection is closed instead of draining an unbounded body
+		// just for keep-alive.
+		if ctx.Request.IsMultipartReaderActive() {
+			if closeErr := ctx.Request.FinishMultipartReader(); closeErr != nil {
+				hlog.SystemLogger().Warnf("multipart reader finalized with error: %s", closeErr)
+			}
+			if ctx.Request.MultipartReaderNeedsClose() {
+				connectionClose = true
+			}
+		}
+
 		connectionClose = connectionClose || ctx.Response.ConnectionClose()
 		if connectionClose {
 			ctx.Response.Header.SetCanonical(bytestr.StrConnection, bytestr.StrClose)
@@ -400,9 +415,17 @@ func (s Server) Serve(c context.Context, conn network.Conn) (err error) {
 
 		// Release request body stream
 		if ctx.Request.IsBodyStream() {
-			err = ext.ReleaseBodyStream(ctx.RequestBodyStream())
-			if err != nil {
-				return
+			if ctx.Request.MultipartReaderNeedsClose() {
+				// The restricted multipart reader stopped inside the
+				// bounded drain budget: do not slurp the remaining
+				// body (skipRest would read without a limit). Detach
+				// the stream and let the connection close below.
+				ctx.Request.CloseBodyStream() //nolint:errcheck
+			} else {
+				err = ext.ReleaseBodyStream(ctx.RequestBodyStream())
+				if err != nil {
+					return
+				}
 			}
 		}
 
